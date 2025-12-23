@@ -1,0 +1,156 @@
+#!/usr/bin/expect -f
+# Script expect générique pour automatiser la configuration syslog sur ASA/Juniper
+# Usage : ./auto_syslog_expect.exp <device> <user> <pass> <type> <syslog_ip>
+
+set timeout 25
+set device [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+set type [lindex $argv 3]
+set syslog_ip [lindex $argv 4]
+
+# per-host debug logfile
+set logfile "/tmp/auto_syslog_${device}.log"
+catch { open $logfile w } fh
+if {[info exists fh]} { close $fh }
+log_file -noappend $logfile
+
+if { $type == "asa" } {
+    puts {[INFO][expect] Connexion SSH vers $device en cours...}
+    spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa $user@$device
+    expect {
+        "*assword:" {
+            puts {[INFO][expect] Prompt password reçu, envoi du mot de passe...}
+            send "$pass\r"
+            exp_continue
+        }
+        ">" {
+            puts {[INFO][expect] Prompt '>' reçu, passage en mode enable...}
+            send "enable\r"
+            expect "Password:"
+            puts {[INFO][expect] Prompt enable password reçu, envoi du mot de passe...}
+            send "$pass\r"
+            expect "#"
+            puts {[INFO][expect] Prompt '#' reçu, passage en mode configuration...}
+            send "configure terminal\r"
+            expect "(config)#"
+            puts {[INFO][expect] Envoi de 'logging host'...}
+            expect "(config)#"
+            puts {[INFO][expect] Envoi de 'logging trap informational'...}
+            send "logging trap informational\r"
+            expect "(config)#"
+            puts {[INFO][expect] Envoi de 'write memory'...}
+            expect "#"
+            puts {[INFO][expect] Fin de la configuration, exit...}
+            send "exit\r"
+        }
+        "#" {
+            puts {[INFO][expect] Prompt '#' reçu directement, passage en mode configuration...}
+            send "configure terminal\r"
+            expect {
+                "(config)#" {}
+                -re "# $" {}
+                timeout { puts "[ERREUR] Impossible d'entrer en mode configuration"; exit 1 }
+            }
+            puts {[INFO][expect] Envoi de 'logging host'...}
+            send "logging host inside $syslog_ip udp/514\r"
+            expect {
+                "(config)#" {}
+                -re "# $" {}
+            }
+            puts {[INFO][expect] Envoi de 'logging trap informational'...}
+            send "logging trap informational\r"
+            expect {
+                "(config)#" {}
+                -re "# $" {}
+            }
+            puts {[INFO][expect] Envoi de 'write memory'...}
+            send "write memory\r"
+            expect {
+                -re "# $" {}
+                timeout {}
+            }
+            puts {[INFO][expect] Fin de la configuration, exit...}
+            send "exit\r"
+        }
+        timeout { puts "[ERREUR] Timeout ou prompt inattendu sur $device"; exit 1 }
+    }
+}
+if { $type == "juniper" } {
+    spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa $user@$device
+    expect {
+        "*assword:" {
+            send "$pass\r"
+            exp_continue
+        }
+        "%" {
+            send "cli\r"
+            expect ">"
+            send "configure\r"
+            expect "#"
+            send "set system syslog host $syslog_ip any any\r"
+            expect "#"
+            send "commit and-quit\r"
+            expect ">"
+            send "exit\r"
+        }
+        ">" {
+            send "configure\r"
+            expect "#"
+            send "set system syslog host $syslog_ip any any\r"
+            expect "#"
+            send "commit and-quit\r"
+            expect ">"
+            send "exit\r"
+        }
+        timeout { puts "[ERREUR] Timeout ou prompt inattendu sur $device"; exit 1 }
+    }
+}
+
+    if { $type == "cisco" } {
+        puts {[INFO][expect] Connexion SSH vers $device (Cisco) en cours...}
+        spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa $user@$device
+        expect {
+            "*assword:" {
+                puts {[INFO][expect] Prompt password reçu, envoi du mot de passe...}
+                send "$pass\r"
+                exp_continue
+            }
+            ">" {
+                puts {[INFO][expect] Prompt '>' reçu, tentative d'élévation en enable...}
+                send "enable\r"
+                expect {
+                    "Password:" {
+                        send "$pass\r"
+                        exp_continue
+                    }
+                    "#" {}
+                    timeout { puts "[ERREUR] Timeout lors de l'élévation enable sur $device"; exit 1 }
+                }
+            }
+            "#" {}
+            timeout { puts "[ERREUR] Timeout ou prompt inattendu sur $device"; exit 1 }
+        }
+        # On est maintenant en prompt '#' ou en enable
+        send "configure terminal\r"
+        expect {
+            "(config)#" { }
+            -re "# $" { }
+            timeout { puts "[ERREUR] Impossible d'entrer en mode configuration sur $device"; exit 1 }
+        }
+        puts {[INFO][expect] Envoi des commandes Cisco (logging)...}
+        send "logging host $syslog_ip transport udp port 514\r"
+        expect "(config)#"
+        send "logging trap informational\r"
+        expect "(config)#"
+        send "end\r"
+        expect "#"
+        send "write memory\r"
+        expect {
+            "#" {}
+            timeout { puts "[INFO][expect] 'write memory' terminé ou prompt non spécifique" }
+        }
+        send "exit\r"
+    }
+
+log_file

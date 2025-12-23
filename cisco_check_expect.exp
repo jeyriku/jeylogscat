@@ -1,0 +1,90 @@
+#!/usr/bin/expect -f
+# Expect helper pour exécuter une commande de vérification sur équipements Cisco
+set timeout 20
+if { $argc < 4 } {
+  puts stderr "Usage: cisco_check_expect.exp <host> <user> <pass> <command>"
+  exit 2
+}
+set host [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+set cmd  [lindex $argv 3]
+
+# Options SSH minimales compatibles avec équipements anciens
+set ssh_opts {-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o ConnectTimeout=5}
+
+# log file per host for debugging
+set logfile "/tmp/cisco_check_${host}.log"
+catch { open $logfile w } fh
+if {[info exists fh]} { close $fh }
+
+spawn ssh {*}$ssh_opts $user@$host
+log_file -noappend $logfile
+
+# attendre hostkey prompt, password prompt ou prompt de l'appareil
+set conn_ok 0
+expect {
+  -re "Are you sure you want to continue connecting" {
+    send "yes\r"
+    exp_continue
+  }
+  -nocase "password:" {
+    send "$pass\r"
+    exp_continue
+  }
+  -re {([a-zA-Z0-9._-]+)[#>]$|[#>]$|>$} {
+    # prompt détecté, marquer connexion OK
+    set conn_ok 1
+  }
+  timeout {
+    puts stderr "[EXPECT] timeout lors de la connexion à $host"
+    exit 3
+  }
+  eof {
+    puts stderr "[EXPECT] eof lors de la connexion à $host"
+    exit 4
+  }
+}
+
+if { $conn_ok == 0 } {
+  puts stderr "[EXPECT] connexion non établie à $host"
+  exit 5
+}
+
+# Assurer affichage complet
+send "terminal length 0\r"
+sleep 0.2
+
+# If we are at '>' prompt, try to elevate to privileged exec
+expect {
+  -re "> $" {
+    send "enable\r"
+    expect {
+      -nocase "password:" {
+        send "$pass\r"
+        exp_continue
+      }
+      -re "# $" {}
+      timeout {}
+    }
+  }
+  default {}
+}
+
+send "$cmd\r"
+
+# récupérer la sortie jusqu'au prochain prompt ou EOF
+expect {
+  -re {([a-zA-Z0-9._-]+)[#>]$|[#>]$|>$} {
+    puts $expect_out(buffer)
+  }
+  eof {
+    puts $expect_out(buffer)
+  }
+  timeout {
+    puts $expect_out(buffer)
+  }
+}
+
+log_file
+exit 0

@@ -1,0 +1,49 @@
+#!/usr/bin/expect -f
+# Diagnostic expect helper
+# Usage: diag_expect.exp <device> <user> <pass> <command>
+set timeout 30
+if { $argc < 4 } {
+    puts {Usage: $argv0 <device> <user> <pass> <command>}
+    exit 2
+}
+set device [lindex $argv 0]
+set user   [lindex $argv 1]
+set pass   [lindex $argv 2]
+set cmd    [lindex $argv 3]
+
+set logfile "/tmp/diag_${device}.log"
+log_file -a $logfile
+puts {[INFO] Diagnostic pour $device — log: $logfile}
+
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa $user@$device
+expect {
+    -re ".*assword.*:" {
+        puts {[INFO] Prompt password reçu, envoi du mot de passe}
+        send "$pass\r"
+        exp_continue
+    }
+    -re ".*# $|.*#$" {
+        puts {[INFO] Prompt '#' détecté}
+        send "$cmd\r"
+        expect {
+            -re ".*# $|.*#$" { send "exit\r" }
+            timeout { puts {[WARN] Timeout après commande} }
+        }
+    }
+    -re ".*> $|.*>$" {
+        puts {[INFO] Prompt '>' détecté}
+        send "$cmd\r"
+        expect {
+            -re ".*> $|.*>$" { send "exit\r" }
+            timeout { puts {[WARN] Timeout après commande} }
+        }
+    }
+    timeout {
+        puts {[ERREUR] Timeout ou prompt inattendu}
+        exit 1
+    }
+}
+log_file
+puts {[INFO] Diagnostic terminé — voir $logfile}
+exit 0
