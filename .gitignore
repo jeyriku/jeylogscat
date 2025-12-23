@@ -1,0 +1,8 @@
+# macOS and Synology artifacts
+.DS_Store
+@eaDir/
+@eaDir/.DS_Store@SynoResource
+
+# logs and runtime
+/tmp/
+*.log

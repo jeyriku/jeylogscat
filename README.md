@@ -1,82 +1,102 @@
-Jeylogscat: backup & syslog tooling
-=================================
+# ELK Backup (placed in /opt/jeylogscat)
 
-This folder contains scripts and helpers used to collect backup health lines and to manage network syslog ingestion:
+Files placed in `/opt/jeylogscat`:
 
-- `push-syslog-to-devices.sh` — push syslog configuration to network devices (Cisco/Juniper/ASA).
-- `create-kibana-network-pattern.sh` — helper to create Kibana index pattern and saved search.
-- `monitor-backup-health.sh` — tails `backup-health.log` and verifies lines are indexed to Elasticsearch.
-- `monitor-email-listener.sh` — watches the monitor log and sends email alerts for WARN/ERROR lines.
-- `send-syslog-email.sh` — sends email notifications using the system MTA; configured to use `syslog@jeyriku.net` as sender.
+- `backup-elk.sh`: Script that rsyncs ELK config dirs to `/opt/jeylogscat/backups/YYYYMMDDTHHMMSSZ` and appends a short entry to `/opt/jeylogscat/ELK_USAGE_GUIDE.md`.
+- `install-cron.sh`: Helper to install a user crontab entry running the backup daily at 02:00.
+- `push-to-nas.sh`: Push helper that prefers SSH key-based rsync and falls back to CIFS using `/etc/syno_cred` (root-only).
 
-Recent changes (2025-12-22):
+Quick start:
 
-- Added `send-syslog-email.sh` and `monitor-email-listener.sh` to notify `syslog@jeyriku.net` on monitor alerts.
-- Created a systemd unit `monitor-backup-health-email.service` to run the email notifier as user `jeyriku`.
-- Configured Postfix to relay outgoing mail through `ssl0.ovh.net` (SMTPS) using the provided credentials.
-
-Backup & restore
-----------------
-
-To create a backup archive of this folder and upload it to the NAS `jeynas01`, run (as root or with sudo):
+1. Make scripts executable (if not already):
 
 ```bash
-DATE=$(date +%F)
-sudo tar -C / -czf /tmp/jeylogscat-backup-${DATE}.tar.gz opt/jeylogscat
-scp /tmp/jeylogscat-backup-${DATE}.tar.gz jeynas01:~/
-sha256sum /tmp/jeylogscat-backup-${DATE}.tar.gz
-ssh jeynas01 "sha256sum ~/jeylogscat-backup-${DATE}.tar.gz"
-```
+sudo chmod +x /opt/jeylogscat/backup-elk.sh
+# ELK Backup (stored in /opt/jeylogscat)
 
-To restore on a host (careful — will overwrite files under `/opt/jeylogscat`):
+This repository contains scripts to create local ELK configuration/data snapshots and push
+them to a Synology NAS. Backups are created as root (to access system dirs) but snapshots
+are chowned to the `jeyriku` user so push operations run unprivileged with an SSH key.
+
+Files
+- `backup-elk.sh` — creates timestamped snapshot directories under `/opt/jeylogscat/backups`
+	and appends a short entry to `ELK_USAGE_GUIDE.md`.
+- `push-to-nas.sh` — pushes the newest snapshot to the NAS using SSH key-based `rsync`. Falls
+	back to CIFS only if absolutely necessary (requires `/etc/syno_cred` root-only file).
+- `verify-backup.sh` — lightweight verification helper.
+- `ELK_USAGE_GUIDE.md` — human-facing notes and change log.
+
+Quick usage
+
+- Make sure scripts are executable:
 
 ```bash
-scp jeynas01:~/jeylogscat-backup-2025-12-22.tar.gz /tmp/
-sudo tar -C / -xzf /tmp/jeylogscat-backup-2025-12-22.tar.gz
+sudo chmod +x /opt/jeylogscat/*.sh
 ```
 
-Security
---------
+- Dry-run a backup (no changes):
 
-- `/etc/postfix/sasl_passwd` contains relay credentials and must be mode 600.
-- `/etc/default/monitor-backup-health` contains `ELASTIC_PASSWORD` and is secured to 0600 root:root.
+```bash
+DRYRUN=1 /opt/jeylogscat/backup-elk.sh
+```
+
+- Run backup+push immediately (systemd service):
+
+```bash
+sudo systemctl start elk-backup.service
+sudo journalctl -u elk-backup.service -n 200 --no-pager
+```
+
+Scheduling (recommended)
+
+The preferred scheduler is a systemd timer that runs the existing `elk-backup.service` at
+02:00 each night. To enable the timer:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now elk-backup.timer
+sudo systemctl status elk-backup.timer --no-pager
+```
+
+I created `/etc/systemd/system/elk-backup.timer` and set `OnCalendar=*-*-* 02:00:00` so the
+backup runs nightly at 02:00 and `Persistent=true` so missed runs are executed at boot if
+needed.
+
+SSH key and push behavior
+
+- The push helper prefers the per-user NAS key `/home/jeyriku/.ssh/id_ed25519_jeynas01`.
+- Backups are chowned to `jeyriku` after creation so `rsync` can run as that user without
+	root-owned files interfering.
+
+Logging and troubleshooting
+
+- Backup and push activity is appended to `/opt/jeylogscat/backup.log`.
+- If a push fails with rsync errors, inspect `/opt/jeylogscat/backup.log` and the systemd
+	journal for `elk-backup.service`.
+
+Security notes
+
+- Do not store NAS credentials in user-readable files. Prefer SSH key-based automation.
+- If CIFS fallback is required, store credentials in `/etc/syno_cred` with root-only
+	permissions and the format:
+
+```
+username=YOUR_NAS_USER
+password=YOUR_PASSWORD
+```
+
+Restore notes
+
+- To restore a file or directory from a snapshot, copy from the desired
+	`/opt/jeylogscat/backups/<TIMESTAMP>/...` location back to the target path. Verify
+	ownership and permissions after restore.
 
 Contact
--------
 
-For questions about these scripts, contact syslog@jeyriku.net.
+If you want me to change scheduling, switch to a different NAS path, or adjust rsync
+options, tell me which option and I will update the scripts and the timer.
 
-Remote backup location
-----------------------
+Git housekeeping
 
-Backups for this host are stored on `jeynas01` under:
-
-```
-/volume1/JeyFiles/Jeremie/Informatique/Lab@Home/BackupSrv/jeysrv03/elk
-```
-
-When copying backups with `scp`, you may use `-o StrictHostKeyChecking=no` the first time to accept the NAS host key automatically.
-
-$(cat /home/jeyriku/README-jeylogscat.md)
-
-Expect fallback (Cisco/Juniper)
--------------------------------
-
-Le script `push-syslog-to-devices.sh` tente d'abord une connexion non-interactive (`ssh` / `sshpass`).
-Si celle-ci échoue, il bascule automatiquement vers des helpers Expect pour gérer :
-
-- l'acceptation de la clé hôte (`Are you sure you want to continue connecting`),
-- les invites de mot de passe (`password:` ou "user's password:"),
-- l'élévation `enable` sur Cisco lorsque nécessaire.
-
-Fichiers concernés :
-
-- `/opt/jeylogscat/auto_syslog_expect.exp` — automation générique pour ASA/Juniper/Cisco
-- `/opt/jeylogscat/cisco_check_expect.exp` — fallback de vérification pour Cisco (post-check)
-- `/opt/jeylogscat/diag_expect.exp` — utilitaire de diagnostic interactif
-
-Rapports
---------
-
-Après exécution, un rapport consolidé est créé sous `/opt/jeylogscat/push-syslog-report-<date>.txt`.
-Les logs Expect par hôte sont enregistrés dans `/tmp/cisco_check_<host>.log` et `/tmp/diag_<host>.log`.
+- A `.gitignore` file has been added to exclude Synology/macOS artifacts and common
+	runtime logs (for example: `.DS_Store`, `@eaDir/`, `/tmp/` and `*.log`).

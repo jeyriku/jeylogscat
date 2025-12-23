@@ -1,0 +1,12 @@
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+    - /opt/jeylogscat/backup-health.log
+  json.keys_under_root: true
+  json.add_error_key: true
+  fields:
+    service: elk-backup-health
+
+# Drop this file into /etc/filebeat/filebeat.d/ or include in your Filebeat config
+# then restart Filebeat to ship health events to ELK.
