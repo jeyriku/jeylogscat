@@ -1,0 +1,38 @@
+
+#!/usr/bin/expect -f
+# Juniper check: attempt cli -c, fallback to interactive; handle username/password
+set timeout 40
+if {$argc < 4} {
+  puts "usage: juniper_check_expect.exp host user password command"
+  exit 2
+}
+set host [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+set cmd  [lindex $argv 3]
+
+# Build ssh command as a list to avoid quoting issues
+set cli_arg "cli -c \"$cmd\""
+set ssh_list [list ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa ${user}@${host} $cli_arg]
+
+## Try interactive SSH session and run CLI inside it (more compatible)
+spawn ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa ${user}@${host}
+expect {
+  -re "(?i)are you sure" { send "yes\r"; exp_continue }
+  -re "(?i)username:" { send "$user\r"; exp_continue }
+  -re "(?i)assword:" { send "$pass\r"; exp_continue }
+  -re ">|#|\$" { ;# got prompt
+    # On Junos, la commande 'cli -c' est requise uniquement quand on est root.
+    if { $user eq "root" } {
+      send "cli -c \"$cmd\"\r"
+    } else {
+      send "$cmd\r"
+    }
+    exp_continue
+  }
+  eof
+  timeout { puts "timeout connecting to $host"; exit 3 }
+}
+set waitres [wait]
+set rc [lindex $waitres 3]
+exit $rc

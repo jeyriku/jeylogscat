@@ -6,3 +6,4 @@
 # logs and runtime
 /tmp/
 *.log
+backups/
