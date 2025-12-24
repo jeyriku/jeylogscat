@@ -39,10 +39,28 @@ exec > >(tee -a "$LOGFILE") 2>&1
 
 # Forcer la compatibilité avec les équipements Cisco/ASA anciens (ssh-rsa)
 # Option -tt (pseudo-terminal) activable uniquement si SSH_FORCE_TTY=1
+# Si un mot de passe est fourni via NETDEV_PASS, ne pas forcer BatchMode=yes
+# afin de permettre l'usage de sshpass/keyboard-interactive.
 if [ "${SSH_FORCE_TTY:-0}" = "1" ]; then
-  SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
+  SSH_TTY_OPT="-tt"
 else
-  SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
+  SSH_TTY_OPT=""
+fi
+
+# Si NETDEV_PASS est défini, autoriser l'auth par mot de passe (ne pas forcer BatchMode=yes)
+if [ -n "${NETDEV_PASS:-}" ]; then
+  BATCH_OPT=""
+else
+  BATCH_OPT="-o BatchMode=yes"
+fi
+
+SSH_OPTS="$BATCH_OPT -o ConnectTimeout=10 $SSH_TTY_OPT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
+
+# If available, use timeout to bound SSH operations
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="timeout 30"
+else
+  TIMEOUT_CMD=""
 fi
 
 ## Chargement de la liste d'équipements
@@ -66,6 +84,8 @@ echo "[INFO] Adresse du serveur syslog utilisée : $SYSLOG_SERVER"
 : "${NETDEV_PASS:=${netdev_passwd:-}}"
 export NETDEV_USER
 export NETDEV_PASS
+# Défaut : mode DRY_RUN activé (1) si non défini
+DRY_RUN=${DRY_RUN:-1}
 
 # Tableaux associatifs pour rapport par équipement
 declare -A REPORT_STATUS REPORT_DETAIL
@@ -98,10 +118,24 @@ for dev in $NETDEVS_RAW; do
       precheck_expected="$SYSLOG_SERVER"
       ;;
   esac
-  if [ "$DRY_RUN" -eq 0 ]; then
+    if [ "$DRY_RUN" -eq 0 ]; then
     if [ "$dtype" = "asa" ]; then
-      echo "[PRE-CHECK] $dev (ASA) : vérification via expect..."
-      precheck_result=$(expect /opt/jeylogscat/asa_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "show running-config | include logging host" 2>&1 || true)
+      echo "[PRE-CHECK] $dev (ASA) : vérification via ssh/expect..."
+        if [ -n "${NETDEV_PASS:-}" ] && command -v sshpass >/dev/null 2>&1; then
+        # Use an interactive-style SSH session (with -tt) to run the show command
+        # because some ASA require privileged mode and prompt for enable.
+        PRECHK_TMP=$(mktemp /tmp/asa_precheck_${dev}_XXXX)
+        if [ -n "${TIMEOUT_CMD:-}" ]; then CMD_PREFIX="$TIMEOUT_CMD"; else CMD_PREFIX=""; fi
+        $CMD_PREFIX sshpass -p "$NETDEV_PASS" ssh -tt -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${NETDEV_USER}@${dev} >"$PRECHK_TMP" 2>&1 <<'EOF'
+terminal pager 0
+show running-config | include logging host
+exit
+EOF
+        precheck_result=$(cat "$PRECHK_TMP" 2>/dev/null || true)
+        rm -f "$PRECHK_TMP" || true
+      else
+        precheck_result=$(expect /opt/jeylogscat/asa_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$precheck_cmd" 2>&1 || true)
+      fi
       if echo "$precheck_result" | grep -q "$precheck_expected"; then
         echo "[PRE-CHECK] $dev : configuration syslog déjà présente, aucune action nécessaire. Passage à l'équipement suivant."
         REPORT_STATUS["$dev"]="ALREADY_PRESENT"
@@ -191,7 +225,10 @@ write memory"
           echo "[DEBUG] Tentative d'automatisation avec expect pour Juniper..."
           expect /opt/jeylogscat/auto_syslog_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "juniper" "$SYSLOG_SERVER" || {
             echo "[GUIDE] Automatisation échouée. Passage en mode interactif guidé."
-            ...existing code...
+            echo "[INFO] Interactive fallback non-implémentée pour Juniper. Marque KO et continue."
+            REPORT_STATUS["$dev"]="KO"
+            REPORT_DETAIL["$dev"]="Fallback expect échoué; intervention manuelle requise."
+            continue
           }
         fi
       fi
@@ -209,11 +246,64 @@ write memory"
       echo "Detected ASA device. Using interface '${ASA_IF}'. Commands to run:"
       echo "$asa_cmds"
       if [ "$DRY_RUN" -eq 0 ]; then
-        echo "[DEBUG] Utilisation systématique d'expect pour ASA ($dev)"
-        expect /opt/jeylogscat/auto_syslog_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "asa" "$SYSLOG_SERVER" >> "$LOGFILE" 2>&1 || {
-          echo "[GUIDE] Automatisation échouée. Passage en mode interactif guidé."
-          ...existing code...
-        }
+            echo "[DEBUG] Tentative d'application non-interactive pour ASA ($dev)"
+            if [ -n "${NETDEV_PASS:-}" ] && command -v sshpass >/dev/null 2>&1; then
+              # Prefer non-interactive here-doc via sshpass+ssh with timeout to avoid blocking
+              SSH_TARGET="${NETDEV_USER}@${dev}"
+              SSH_COMMON_OPTS="-o ConnectTimeout=10 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -tt"
+              if command -v timeout >/dev/null 2>&1; then
+                timeout_cmd="timeout 30"
+              else
+                timeout_cmd=""
+              fi
+              # Build command prefix with timeout if available
+              if [ -n "${TIMEOUT_CMD:-}" ]; then
+                CMD_PREFIX="$TIMEOUT_CMD"
+              else
+                CMD_PREFIX=""
+              fi
+              # Send commands line-by-line (with small pause) to ensure ASA accepts interactive-style input
+              # Send commands line-by-line (with small pause) to ensure ASA accepts interactive-style input
+              if ( while IFS= read -r line; do
+                        printf "%s\n" "$line"
+                        sleep 0.4
+                      done <<< "$asa_cmds" | $CMD_PREFIX sshpass -p "$NETDEV_PASS" ssh $SSH_COMMON_OPTS $SSH_TARGET >>"$LOGFILE" 2>&1 ); then
+                echo "[INFO] ASA $dev: commandes envoyées via sshpass/ssh"
+              else
+                echo "[WARN] ASA $dev: tentative sshpass non-interactive retournée non-nulle (voir $LOGFILE), vérification post-apply..."
+              fi
+              # Vérifier la configuration après tentative d'envoi (même si le RC ssh n'était pas zéro)
+              PRECHK_TMP=$(mktemp /tmp/asa_postcheck_${dev}_XXXX)
+              if [ -n "${TIMEOUT_CMD:-}" ]; then CMD_PREFIX="$TIMEOUT_CMD"; else CMD_PREFIX=""; fi
+              $CMD_PREFIX sshpass -p "$NETDEV_PASS" ssh -tt -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${NETDEV_USER}@${dev} >"$PRECHK_TMP" 2>&1 <<'EOF'
+terminal pager 0
+show running-config | include logging host
+exit
+EOF
+              postcheck_result=$(cat "$PRECHK_TMP" 2>/dev/null || true)
+              rm -f "$PRECHK_TMP" || true
+              if echo "$postcheck_result" | grep -q "$SYSLOG_SERVER"; then
+                echo "[INFO] ASA $dev : configuration syslog détectée après tentative non-interactive."
+                REPORT_STATUS["$dev"]="OK"
+                REPORT_DETAIL["$dev"]="Appliquée via sshpass + vérification post-apply"
+                continue
+              else
+                echo "[WARN] ASA $dev : vérification post-apply ne montre pas la configuration; fallback Expect..."
+              fi
+            fi
+            # Fallback to Expect if sshpass not usable or failed
+            if expect /opt/jeylogscat/auto_syslog_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "asa" "$SYSLOG_SERVER" >> "$LOGFILE" 2>&1; then
+              echo "[INFO] Automatisation via expect réussie pour $dev"
+              REPORT_STATUS["$dev"]="OK"
+              REPORT_DETAIL["$dev"]="Appliquée via expect"
+              continue
+            else
+              echo "[GUIDE] Automatisation échouée. Passage en mode interactif guidé."
+              echo "[INFO] Interactive fallback non-implémentée pour ASA. Marque KO et continue."
+              REPORT_STATUS["$dev"]="KO"
+              REPORT_DETAIL["$dev"]="Fallback expect échoué; intervention manuelle requise."
+              continue
+            fi
       fi
       ;;
   esac
@@ -236,9 +326,17 @@ write memory"
   else
     echo "Vérification post-config sur $dev..."
     if [ "$dtype" = "asa" ]; then
-      result=$(expect /opt/jeylogscat/asa_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$check_cmd" 2>&1 || true)
+      if [ -n "${NETDEV_PASS:-}" ] && command -v sshpass >/dev/null 2>&1; then
+        result=$(sshpass -p "$NETDEV_PASS" ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${NETDEV_USER}@${dev} "$check_cmd" 2>&1 || true)
+      else
+        result=$(expect /opt/jeylogscat/asa_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$check_cmd" 2>&1 || true)
+      fi
     elif [ "$dtype" = "juniper" ]; then
-      result=$(expect /opt/jeylogscat/juniper_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$check_cmd" 2>&1 || true)
+      if [ -n "${NETDEV_PASS:-}" ] && command -v sshpass >/dev/null 2>&1; then
+        result=$(sshpass -p "$NETDEV_PASS" ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${NETDEV_USER}@${dev} "$check_cmd" 2>&1 || true)
+      else
+        result=$(expect /opt/jeylogscat/juniper_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$check_cmd" 2>&1 || true)
+      fi
     else
       result=$(eval "$SSH_PREFIX_STR ssh $SSH_OPTS ${NETDEV_USER}@${dev} \"$check_cmd\" 2>&1" || true)
       # Si le check SSH ne retourne pas la valeur attendue, tenter un fallback via expect (Cisco interactif)
@@ -292,7 +390,11 @@ for dev in $NETDEVS_RAW; do
     if [ "$dtype" = "asa" ]; then
       result=$(expect /opt/jeylogscat/asa_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$check_cmd" 2>&1 || true)
     elif [ "$dtype" = "juniper" ]; then
-      result=$(expect /opt/jeylogscat/juniper_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$check_cmd" 2>&1 || true)
+      if [ -n "${NETDEV_PASS:-}" ] && command -v sshpass >/dev/null 2>&1; then
+        result=$(sshpass -p "$NETDEV_PASS" ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${NETDEV_USER}@${dev} "$check_cmd" 2>&1 || true)
+      else
+        result=$(expect /opt/jeylogscat/juniper_check_expect.exp "$dev" "$NETDEV_USER" "$NETDEV_PASS" "$check_cmd" 2>&1 || true)
+      fi
     else
       result=$(eval "$SSH_PREFIX_STR ssh $SSH_OPTS ${NETDEV_USER}@${dev} \"$check_cmd\" 2>&1" || true)
       # Tentative de fallback expect si la vérification SSH ne trouve pas la bonne valeur

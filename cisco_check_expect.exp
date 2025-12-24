@@ -1,3 +1,46 @@
+
+#!/usr/bin/expect -f
+# Cisco check: run a verification command, handling username/password and enable
+set timeout 40
+if {$argc < 4} {
+  puts "usage: cisco_check_expect.exp host user password command"
+  exit 2
+}
+set host [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+set cmd  [lindex $argv 3]
+
+set ssh_opts "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
+spawn ssh -tt $ssh_opts $user@$host
+expect {
+  -re "(?i)are you sure" { send "yes\r"; exp_continue }
+  -re "(?i)username:" { send "$user\r"; exp_continue }
+  -re "(?i)assword:" { send "$pass\r"; exp_continue }
+  -re "> $|# $|\$ $" { }
+  timeout { puts STDERR "timeout connecting to $host"; exit 3 }
+}
+# If prompt is '>' try enable
+expect {
+  -re "> $" {
+    send "enable\r"
+    expect {
+      -re "(?i)assword:" { send "$pass\r" }
+      -re "# $" { }
+      timeout { }
+    }
+  }
+  -re "# $|\$ $" { }
+  timeout { }
+}
+send -- "$cmd\r"
+expect {
+  -re "> $|# $|\$ $" { }
+  eof
+  timeout { puts STDERR "timeout waiting for command"; exit 4 }
+}
+wait
+exit [lindex [wait] 3]
 #!/usr/bin/expect -f
 # Expect helper pour exécuter une commande de vérification sur équipements Cisco
 set timeout 20

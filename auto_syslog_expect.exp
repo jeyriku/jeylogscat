@@ -1,4 +1,94 @@
 #!/usr/bin/expect -f
+# Robust generic Expect helper to apply syslog configuration on Cisco/ASA/Juniper devices
+# Usage: auto_syslog_expect.exp host user pass type syslog_server [asa_interface] [enable_pass]
+set timeout 60
+if {$argc < 5} {
+    puts "usage: auto_syslog_expect.exp host user password type syslog_server [asa_interface] [enable_pass]"
+    puts "  type: cisco|asa|juniper"
+    exit 2
+}
+set host [lindex $argv 0]
+set user [lindex $argv 1]
+set pass [lindex $argv 2]
+set dtype [string tolower [lindex $argv 3]]
+set server [lindex $argv 4]
+set asa_if "inside"
+set enable_pass ""
+if {$argc >= 6} { set asa_if [lindex $argv 5] }
+if {$argc >= 7} { set enable_pass [lindex $argv 6] }
+
+proc send_cmd {line} {
+    send -- "$line\r"
+    sleep 1
+}
+
+set ssh_opts "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
+
+if {$dtype == "juniper"} {
+    # Try non-interactive commit via cli -c; fallback handled by expect patterns
+    set cmd "cli -c \"configure; set system syslog host $server any any; commit and-quit\""
+    spawn ssh $ssh_opts $user@$host $cmd
+    expect {
+        -re "(?i)are you sure" { send "yes\r"; exp_continue }
+        -re "(?i)username:" { send "$user\r"; exp_continue }
+        -re "(?i)assword:" { send "$pass\r"; exp_continue }
+        -re "commit complete|configuration check" { }
+        eof
+        timeout { puts STDERR "timeout connecting to $host"; exit 3 }
+    }
+    wait
+    exit [lindex [wait] 3]
+}
+
+# Cisco / ASA interactive flow
+spawn ssh -tt $ssh_opts $user@$host
+expect {
+    -re "(?i)are you sure" { send "yes\r"; exp_continue }
+    -re "(?i)username:" { send "$user\r"; exp_continue }
+    -re "(?i)assword:" { send "$pass\r"; exp_continue }
+    -re "> $|# $|\$ $" { }
+    timeout { puts STDERR "timeout connecting to $host"; exit 3 }
+}
+
+# If we are at '>' prompt and have enable password, try enable
+expect {
+    -re "> $" {
+        if {$enable_pass ne ""} {
+            send_cmd "enable"
+            expect {
+                -re "(?i)assword:" { send "$enable_pass\r" }
+                -re "# $" { }
+                timeout { }
+            }
+        }
+    } -re "# $|\$ $" { }
+    timeout { }
+}
+
+if {$dtype == "cisco"} {
+    send_cmd "terminal length 0"
+    send_cmd "configure terminal"
+    send_cmd "logging host $server transport udp port 514"
+    send_cmd "logging trap informational"
+    send_cmd "end"
+    send_cmd "write memory"
+} elseif {$dtype == "asa"} {
+    send_cmd "terminal pager 0"
+    send_cmd "configure terminal"
+    send_cmd "logging host $asa_if $server udp/514"
+    send_cmd "logging trap informational"
+    send_cmd "exit"
+    send_cmd "write memory"
+} else {
+    puts STDERR "unknown device type: $dtype"
+    exit 4
+}
+
+send_cmd "exit"
+expect eof
+wait
+exit [lindex [wait] 3]
+#!/usr/bin/expect -f
 # Script expect générique pour automatiser la configuration syslog sur ASA/Juniper
 # Usage : ./auto_syslog_expect.exp <device> <user> <pass> <type> <syslog_ip>
 
